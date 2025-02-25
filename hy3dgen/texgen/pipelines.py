@@ -77,21 +77,22 @@ class Hunyuan3DPaintPipeline:
         else:
             return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path))
     
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         self.config = config
         self.models = {}
         self.render = MeshRender(
             default_resolution=self.config.render_size,
             texture_size=self.config.texture_size)
 
-        self.load_models()
+        self.load_models(**kwargs)
 
-    def load_models(self):
+    def load_models(self, **kwargs):
         # empty cude cache
         torch.cuda.empty_cache()
         # Load model
-        self.models['delight_model'] = Light_Shadow_Remover(self.config)
-        self.models['multiview_model'] = Multiview_Diffusion_Net(self.config)
+        
+        self.models['delight_model'] = kwargs.get('delight_model', None) or Light_Shadow_Remover(self.config)
+        self.models['multiview_model'] = kwargs.get('multiview_model', None) or Multiview_Diffusion_Net(self.config)
         # self.models['super_model'] = Image_Super_Net(self.config)
 
     def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True):
@@ -174,7 +175,7 @@ class Hunyuan3DPaintPipeline:
         return new_image
 
     @torch.no_grad()
-    def __call__(self, mesh, image):
+    def __call__(self, mesh, image, device, low_vram = False, offload_device='cpu'):
 
         if isinstance(image, str):
             image_prompt = Image.open(image)
@@ -183,7 +184,10 @@ class Hunyuan3DPaintPipeline:
         
         image_prompt = self.recenter_image(image_prompt)
 
+        self.models['delight_model'].to(device)
         image_prompt = self.models['delight_model'](image_prompt)
+        if low_vram:
+            self.models['delight_model'].to(offload_device)
 
         mesh = mesh_uv_wrap(mesh)
 
@@ -200,8 +204,12 @@ class Hunyuan3DPaintPipeline:
         camera_info = [(((azim // 30) + 9) % 12) // {-20: 1, 0: 1, 20: 1, -90: 3, 90: 3}[
             elev] + {-20: 0, 0: 12, 20: 24, -90: 36, 90: 40}[elev] for azim, elev in
                        zip(selected_camera_azims, selected_camera_elevs)]
+        
+        self.models['multiview_model'].to(device)
         multiviews = self.models['multiview_model'](image_prompt, normal_maps + position_maps, camera_info)
-
+        if low_vram:
+            self.models['multiview_model'].to(offload_device)
+    
         for i in range(len(multiviews)):
             # multiviews[i] = self.models['super_model'](multiviews[i])
             multiviews[i] = multiviews[i].resize(

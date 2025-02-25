@@ -44,6 +44,10 @@ class Light_Shadow_Remover():
         pipeline.set_progress_bar_config(disable=True)
 
         self.pipeline = pipeline.to(self.device, torch.float16)
+        
+    def to(self, device):
+        self.device = device
+        self.pipeline = self.pipeline.to(device, torch.float16)
     
     def recorrect_rgb(self, src_image, target_image, alpha_channel, scale=0.95):
         

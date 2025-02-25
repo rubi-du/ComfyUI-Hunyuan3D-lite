@@ -7,12 +7,20 @@ import torch
 from trimesh import Trimesh
 import comfy.model_management as mm
 from folder_paths import models_dir, get_filename_list, get_full_path_or_raise, get_folder_paths, get_save_image_path, get_output_directory
-from modules.image_util import tensor2pil
+from .hy3dgen.texgen.pipelines import Hunyuan3DTexGenConfig
+from .hy3dgen.texgen.utils.dehighlight_utils import Light_Shadow_Remover
+from .modules.image_util import tensor2pil
 from .hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline, FaceReducer, FloaterRemover, DegenerateFaceRemover
 from .hy3dgen.texgen import Hunyuan3DPaintPipeline
 log = logging.getLogger(__name__)
 
-model_dir = os.path.join(os.path.dirname(__file__), "models") 
+model_dir = os.path.join(os.path.dirname(__file__), "models")
+
+def dict_to_obj(data, class_name='DynamicObject'):
+    return type(class_name, (), {
+        '__slots__': data.keys(),
+        **{k: v for k, v in data.items()}
+    })()
 
 def get_device_by_name(device):
     """
@@ -61,10 +69,10 @@ class HunyuanImage23DModelLoader:
         return m.digest().hex()
 
     def load_model(self, model_path, fast):
-        mm.unload_all_models()
+        device = mm.get_torch_device()
+        offload_device=mm.unet_offload_device()
         
         ckpt_path = get_full_path_or_raise("checkpoints", model_path)
-        device = get_device_by_name('auto')
         extra_args = {}
         model_subdir = 'hunyuan3d-dit-v2-0'
         use_safetensors = model_path.endswith(".safetensors")
@@ -77,10 +85,11 @@ class HunyuanImage23DModelLoader:
         pipe = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
             ckpt_path,
             config_path,
-            device=device,
+            device=offload_device,
             use_safetensors=use_safetensors,
             **extra_args
         )
+        setattr(pipe, 'run_device', device)
         return (pipe,)
 
 class Hunyuan3DPaintModelLoader:
@@ -88,7 +97,8 @@ class Hunyuan3DPaintModelLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # "model_path": (cls.hunyuan_model_list(), ),
+                "light_remover_ckpt_path": ("STRING", {"default": "hunyuan3d-delight-v2-0"} ),
+                "multiview_ckpt_path": ("STRING", {"default": "hunyuan3d-multiview-v2-0"} ),
             },
         }
     RETURN_TYPES = ("HunyunInpaintModel",)
@@ -102,11 +112,27 @@ class Hunyuan3DPaintModelLoader:
         return list(filter(lambda x: os.path.basename(x).endswith(".safetensors"), unet_models)) + \
             list(filter(lambda x: os.path.basename(x).endswith('.ckpt'), unet_models))
     
-    def load_model(self):
-        mm.unload_all_models()
+    def load_model(self, light_remover_ckpt_path, multiview_ckpt_path):
         model_path = get_folder_paths("models")
-        hunyuan_path = os.path.join(model_path, "Hunyuan3D-2")
-        return Hunyuan3DPaintPipeline.from_pretrained(hunyuan_path)
+        offline_device = mm.unet_offload_device()
+        light_remover_ckpt_config = dict_to_obj({
+            "device": offline_device,
+            "light_remover_ckpt_path": os.path.join(model_path, light_remover_ckpt_path),
+        })
+        
+        multiview_ckpt_config = dict_to_obj({
+            "device": offline_device,
+            "multiview_ckpt_path": os.path.join(model_path, multiview_ckpt_path),
+        })
+        
+        config = Hunyuan3DTexGenConfig(light_remover_ckpt_config.light_remover_ckpt_path, multiview_ckpt_config.multiview_ckpt_path)
+        
+        delight_model = Light_Shadow_Remover(light_remover_ckpt_config)
+        multiview_model = Hunyuan3DPaintPipeline.from_pretrained(multiview_ckpt_config)
+        
+        pipeline = Hunyuan3DPaintPipeline(config, delight_model=delight_model, multiview_model=multiview_model)
+        
+        return (pipeline,)
         
 class HunyuanImage23DRunner:
     @classmethod
@@ -116,7 +142,7 @@ class HunyuanImage23DRunner:
                 "image": ("IMAGE",),
                 "hunyuanmodel": ('HunyunModel',),
                 "guidance_scale": ("FLOAT", {'default': 7.5, "min": 0, "max": 30, "step": 0.1}),
-                "num_inference_steps": ("INT", {"default": 50, "min": 10, "max": 60, "step": 1}),
+                "steps": ("INT", {"default": 50, "min": 10, "max": 60, "step": 1}),
                 "remove_floaters": ("BOOLEAN", {"default": True}),
                 "remove_degenerate_faces": ("BOOLEAN", {"default": True}),
                 "reduce_faces": ("BOOLEAN", {"default": True}),
@@ -167,17 +193,22 @@ class HunyuanImage23DRunner:
         if image.dim() == 2:
             image = torch.unsqueeze(image, 0)
         image = tensor2pil(image[0])
+        
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+        run_device = getattr(hunyuanmodel, 'run_device')
+        offline_device = mm.unet_offload_device()
+        if run_device:
+            hunyuanmodel.to(run_device)
         mesh = hunyuanmodel(
             image=image,
             mc_algo='mc',
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             generator=torch.manual_seed(2025))[0]
-        # mesh = FloaterRemover()(mesh)
-        # mesh = DegenerateFaceRemover()(mesh)
-        # mesh = FaceReducer()(mesh)
+        if offline_device:
+            hunyuanmodel.to(offline_device)
         new_mesh = mesh.copy()
-        # mesh.export('mesh.glb')
         if remove_floaters:
             new_mesh = FloaterRemover()(new_mesh)
             log.info(f"Removed floaters, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
@@ -197,27 +228,29 @@ class Hunyuan3DMeshTextureRunner:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "mesh": ("TRIMESH",),
                 "image": ("IMAGE",),
-                "hunyuanmodel": ("HunyunInpaintModel",)
+                "mesh": ("TRIMESH",),
+                "hunyuanmodel": ("HunyunInpaintModel",),
+                "low_vram": ("BOOLEAN", {"default": False})
             }
         }
     RETURN_TYPES = ("TRIMESH",)
     RETURN_NAMES = ("mesh",)
     FUNCTION = "texture"
     CATEGORY = "Hunyuan"
-    
-    # @classmethod
-    # def IS_CHANGED(s, mesh, image, hunyuaninpaintmodel: Hunyuan3DPaintPipeline):
-    #     m = hashlib.sha256()
-    #     m.update(np.array(mesh).tobytes())
-    #     m.update(np.array(image).tobytes())
-    #     m.update(str(hunyuaninpaintmodel.__hash__()).encode())
-    #     return m.digest().hex()
 
-    def texture(self, mesh, image, hunyuaninpaintmodel: Hunyuan3DPaintPipeline):
-        mesh = hunyuaninpaintmodel(mesh, image=image)
-        return mesh
+    def texture(self,
+                image,
+                mesh,
+                hunyuaninpaintmodel: Hunyuan3DPaintPipeline,
+                low_vram
+                ):
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+        device = mm.get_torch_device()
+        offload_device=mm.unet_offload_device()
+        mesh = hunyuaninpaintmodel(mesh, image=image, device=device, low_vram=low_vram, offload_device=offload_device)
+        return (mesh,)
     
         
 class Hunyuan3DViewer:
